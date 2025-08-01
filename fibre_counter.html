@@ -250,11 +250,21 @@
 
       if(!worker){ statusEl.textContent='No worker available'; return; }
       worker.postMessage({
-        type:'process', width,height, data:buf,
-        thresholdRoundness,maxSide,method,
-        innerScale,ringDeltaFactor,minCircularity,
-        requireIntensityTest,relaxShapeFallback,strongDenoise
-      }, [buf]);
+        type: 'process',
+        width: width,
+        height: height,
+        data: buf,
+        thresholdRoundness,
+        maxSide,
+        method,
+        innerScale,
+        ringDeltaFactor,
+        minCircularity,
+        requireIntensityTest,
+        relaxShapeFallback,
+        strongDenoise
+      });  // ← no transfer list
+
     }
 
     fileInput.addEventListener('change', function(e){

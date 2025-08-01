@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Fibre Roundness Counter</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; margin:16px; }
+    .flex { display:flex; gap:12px; flex-wrap:wrap; }
+    label { margin-right:12px; }
+    canvas { border:1px solid #ccc; border-radius:6px; background:#f9f9f9; width:100%; height:auto; }
+    .panel { border:1px solid #e2e2e2; padding:10px; border-radius:6px; }
+    table { border-collapse:collapse; width:100%; font-size:12px; }
+    th, td { border:1px solid #ccc; padding:4px 6px; text-align:right; }
+    th { background:#f5f5f5; }
+  </style>
+</head>
+<body>
+  <h2>Fibre Roundness Counter</h2>
+  <div style="margin-bottom:8px;">
+    <label>Image <input id="fileInput" type="file" accept="image/*" /></label>
+    <label>Roundness threshold <input id="numberThreshold" type="number" min="0" max="1" step="0.01" value="0.95" style="width:70px;" /></label>
+    <button id="processBtn">Process</button>
+    <button id="exportBtn">Export CSV</button>
+    <span id="summary" style="margin-left:20px; font-weight:600;">Ready.</span>
+  </div>
+
+  <div class="flex" style="margin-bottom:10px;">
+    <div style="flex:1; min-width:200px;">
+      <div><small>Original</small></div>
+      <canvas id="srcCanvas" width="320" height="240"></canvas>
+    </div>
+    <div style="flex:1; min-width:200px;">
+      <div><small>Overlay</small></div>
+      <canvas id="dstCanvas" width="320" height="240"></canvas>
+    </div>
+    <div style="flex:1; min-width:220px;">
+      <div class="panel">
+        <div><strong>Tuning</strong></div>
+        <div>
+          <div>
+            <label>Max side: <input id="maxSide" type="range" min="512" max="4096" step="64" value="1200" /></label>
+            <div><small>Current: <span id="maxSideVal">1200</span></small></div>
+          </div>
+          <div>
+            <label>Method
+              <select id="method">
+                <option value="adaptive" selected>Adaptive</option>
+                <option value="otsu">Otsu</option>
+              </select>
+            </label>
+          </div>
+          <div>
+            <label>Inner scale <input id="innerScale" type="number" step="0.05" min="0.2" max="0.6" value="0.35" style="width:60px;" /></label>
+          </div>
+          <div>
+            <label>Ring delta <input id="ringDeltaFactor" type="number" step="0.02" min="0.05" max="0.3" value="0.12" style="width:60px;" /></label>
+          </div>
+          <div>
+            <label>Min circ. <input id="minCircularity" type="number" step="0.05" min="0.3" max="0.8" value="0.5" style="width:60px;" /></label>
+          </div>
+          <div>
+            <label><input id="requireIntensityTest" type="checkbox" checked /> Intensity</label><br/>
+            <label><input id="relaxShapeFallback" type="checkbox" checked /> Relax fallback</label><br/>
+            <label><input id="strongDenoise" type="checkbox" checked /> Denoise</label>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin:6px 0;">
+    <progress id="prog" value="0" max="100" style="width:300px;"></progress>
+    <span id="pct">0%</span>
+    <span id="status" style="margin-left:8px;">Idle</span>
+  </div>
+
+  <div class="flex" style="margin-top:10px;">
+    <div style="flex:1; min-width:220px;">
+      <div><small>Binary mask</small></div>
+      <canvas id="maskCanvas" width="320" height="160" style="display:block;"></canvas>
+    </div>
+    <div style="flex:2; min-width:300px;">
+      <div><small>Detections</small></div>
+      <div style="max-height:240px; overflow:auto;">
+        <table id="resultsTable">
+          <thead>
+            <tr><th>#</th><th>cx</th><th>cy</th><th>major</th><th>minor</th><th>round</th><th>circ</th><th>Δ</th><th>below?</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (function(){
+    // <-- replace below with your Drive direct download worker URL -->
+    const WORKER_URL = 'https://drive.google.com/uc?export=download&id=1zDRCOPGUrzTg-drS6pA8jXy3PVX887iU';
+
+    const fileInput = document.getElementById('fileInput');
+    const processBtn = document.getElementById('processBtn');
+    const exportBtn = document.getElementById('exportBtn');
+    const srcCanvas = document.getElementById('srcCanvas');
+    const dstCanvas = document.getElementById('dstCanvas');
+    const maskCanvas = document.getElementById('maskCanvas');
+    const prog = document.getElementById('prog');
+    const pct = document.getElementById('pct');
+    const statusEl = document.getElementById('status');
+    const summary = document.getElementById('summary');
+    const tbody = document.querySelector('#resultsTable tbody');
+    const numberThreshold = document.getElementById('numberThreshold') || { value: '0.95' };
+    const maxSideEl = document.getElementById('maxSide');
+    const maxSideVal = document.getElementById('maxSideVal');
+    const methodEl = document.getElementById('method');
+    const innerScaleEl = document.getElementById('innerScale');
+    const ringDeltaFactorEl = document.getElementById('ringDeltaFactor');
+    const minCircularityEl = document.getElementById('minCircularity');
+    const requireIntensityTestEl = document.getElementById('requireIntensityTest');
+    const relaxShapeFallbackEl = document.getElementById('relaxShapeFallback');
+    const strongDenoiseEl = document.getElementById('strongDenoise');
+
+    let imgLoaded=false;
+    let worker=null;
+    let workerInitialized=false;
+
+    function setProgress(p,msg){
+      const v=Math.max(0,Math.min(100,Math.round(p)));
+      prog.value=v;
+      pct.textContent=v+'%';
+      if(msg) statusEl.textContent=msg;
+    }
+
+    function handleMessage(e){
+      const d=e.data||{};
+      if(d.type==='progress'){
+        workerInitialized=true;
+        setProgress(d.pct||0,d.msg||'');
+      } else if(d.type==='done'){
+        setProgress(100,'Done');
+        if(d.binaryMask){
+          const bm=d.binaryMask;
+          const ctx=maskCanvas.getContext('2d');
+          maskCanvas.width=bm.cols; maskCanvas.height=bm.rows;
+          const id=ctx.createImageData(bm.cols,bm.rows);
+          for(let i=0;i<bm.data.length;i++){
+            const v=bm.data[i];
+            id.data[i*4+0]=v; id.data[i*4+1]=v; id.data[i*4+2]=v; id.data[i*4+3]=255;
+          }
+          ctx.putImageData(id,0,0);
+        }
+        drawOverlay(d.detections,d.width,d.height);
+        populateTable(d.detections);
+        summary.textContent='Detected: '+d.total+' fibres. Roundness < threshold: '+d.below+'. Threshold = '+d.thresholdRoundness+'.';
+      } else if(d.type==='error'){
+        statusEl.textContent='Worker error: '+d.message;
+      }
+    }
+
+    async function fetchAndCreateWorker(){
+      try {
+        const resp=await fetch(WORKER_URL);
+        if(!resp.ok) throw new Error('fetch status '+resp.status);
+        const text=await resp.text();
+        const blob=new Blob([text],{type:'application/javascript'});
+        worker=new Worker(URL.createObjectURL(blob));
+        worker.onmessage=handleMessage;
+        worker.onerror=(e)=>{ statusEl.textContent='Worker error: '+(e.message||'unknown'); };
+        statusEl.textContent='Loaded worker via fetch fallback.';
+      } catch (err){
+        statusEl.textContent='Failed to load worker: '+err.message;
+      }
+    }
+
+    async function initWorker(){
+      if(worker){ try{ worker.terminate(); } catch{} }
+      workerInitialized=false;
+      statusEl.textContent='Initializing worker...';
+      try {
+        worker=new Worker(WORKER_URL);
+        worker.onmessage=handleMessage;
+        worker.onerror=async (e)=> {
+          await fetchAndCreateWorker();
+        };
+        setTimeout(()=>{
+          if(!workerInitialized){
+            fetchAndCreateWorker();
+          }
+        },6000);
+      } catch (err){
+        await fetchAndCreateWorker();
+      }
+    }
+
+    function drawOverlay(dets,w,h){
+      dstCanvas.width=w; dstCanvas.height=h;
+      const ctx=dstCanvas.getContext('2d');
+      ctx.clearRect(0,0,w,h);
+      ctx.drawImage(srcCanvas,0,0);
+      ctx.save();
+      ctx.lineWidth=2; ctx.font='12px system-ui'; ctx.textBaseline='bottom';
+      let idx=0;
+      dets.forEach(function(d){
+        idx++;
+        ctx.strokeStyle=d.below?'red':'green';
+        ctx.beginPath();
+        ctx.ellipse(d.cx,d.cy,d.major/2,d.minor/2,d.angle*Math.PI/180,0,2*Math.PI);
+        ctx.stroke();
+        ctx.fillStyle=ctx.strokeStyle;
+        ctx.fillText(idx+':'+d.roundness.toFixed(3),d.cx+3,d.cy-3);
+      });
+      ctx.restore();
+    }
+
+    function populateTable(dets){
+      tbody.innerHTML='';
+      let idx=0;
+      dets.forEach(function(d){
+        idx++;
+        const tr=document.createElement('tr');
+        const vals=[idx,d.cx.toFixed(1),d.cy.toFixed(1),d.major.toFixed(1),d.minor.toFixed(1),
+                    d.roundness.toFixed(4),d.circ.toFixed(2),d.delta.toFixed(1),d.below?'Y':'N'];
+        vals.forEach(function(v){
+          const td=document.createElement('td');
+          td.textContent=v;
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+    }
+
+    async function run(){
+      if(!imgLoaded){ statusEl.textContent='Load image first'; return; }
+      await initWorker();
+      setProgress(1,'Sending to worker...');
+      const thresholdRoundness=parseFloat(numberThreshold.value);
+      const maxSide=parseInt(maxSideEl.value,10);
+      const method=methodEl.value;
+      const innerScale=parseFloat(innerScaleEl.value);
+      const ringDeltaFactor=parseFloat(ringDeltaFactorEl.value);
+      const minCircularity=parseFloat(minCircularityEl.value);
+      const requireIntensityTest=requireIntensityTestEl.checked;
+      const relaxShapeFallback=relaxShapeFallbackEl.checked;
+      const strongDenoise=strongDenoiseEl.checked;
+
+      const ctx=srcCanvas.getContext('2d');
+      const width=srcCanvas.width, height=srcCanvas.height;
+      const imageData=ctx.getImageData(0,0,width,height);
+      const buf=new Uint8ClampedArray(imageData.data).buffer;
+
+      if(!worker){ statusEl.textContent='No worker available'; return; }
+      worker.postMessage({
+        type:'process', width,height, data:buf,
+        thresholdRoundness,maxSide,method,
+        innerScale,ringDeltaFactor,minCircularity,
+        requireIntensityTest,relaxShapeFallback,strongDenoise
+      }, [buf]);
+    }
+
+    fileInput.addEventListener('change', function(e){
+      const file=e.target.files && e.target.files[0];
+      if(!file) return;
+      const img=new Image();
+      img.onload=function(){
+        srcCanvas.width=img.naturalWidth; srcCanvas.height=img.naturalHeight;
+        srcCanvas.getContext('2d').drawImage(img,0,0);
+        imgLoaded=true;
+        run();
+      };
+      img.src=URL.createObjectURL(file);
+    });
+    processBtn.addEventListener('click', run);
+    exportBtn.addEventListener('click', function(){
+      const rows=[['index','cx','cy','major','minor','roundness','circ','delta','below']];
+      document.querySelectorAll('#resultsTable tbody tr').forEach(function(tr){
+        const cells=Array.from(tr.querySelectorAll('td')).map(function(td){return td.textContent;});
+        rows.push(cells);
+      });
+      const csv=rows.map(function(r){return r.join(',');}).join('\n');
+      const a=document.createElement('a');
+      a.href=URL.createObjectURL(new Blob([csv], {type:'text/csv'}));
+      a.download='fibre_roundness.csv';
+      a.click();
+    });
+    maxSideEl.addEventListener('input', function(){ if(maxSideVal) maxSideVal.textContent=maxSideEl.value; });
+
+    summary.textContent='Ready. Load image.';
+    setProgress(0,'');
+    initWorker();
+  })();
+  </script>
+</body>
+</html>

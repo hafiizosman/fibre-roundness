@@ -194,7 +194,7 @@ self.onmessage = async (e) => {
       detections,
       width: ow, height: oh,
       binaryMask: { data: maskClone.data, rows: maskClone.rows, cols: maskClone.cols }
-    }, [maskClone.data.buffer]);
+    });
     send('progress', { pct: 100, msg: 'Done' });
     maskClone.delete();
   } catch (err) {
